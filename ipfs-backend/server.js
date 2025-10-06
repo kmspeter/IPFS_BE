@@ -22,6 +22,11 @@ const getIpfs = async () => {
   return _ipfsClient;
 };
 
+// (Node < 18 환경 대비) fetch 폴리필
+if (typeof fetch === 'undefined') {
+  global.fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+}
+
 // 미들웨어 설정
 app.use(helmet({
   // 교차 출처 다운로드(파일 응답) 시 정책 완화가 필요한 경우에만 유지
@@ -32,7 +37,7 @@ app.use(morgan('combined'));
 
 // 여러 오리진 허용 + 프리플라이트 대응
 const allowedOrigins = (process.env.ALLOWED_ORIGINS
-  || 'https://ai-platform-tau.vercel.app,http://localhost:5173')
+  || 'https://ai-modelhub-platform.vercel.app,http://localhost:5173')
   .split(',')
   .map(s => s.trim());
 
@@ -53,7 +58,6 @@ app.use(cors({
 app.options(/.*/, cors());
 
 app.use(express.json({ limit: '10mb' }));
-
 
 // Multer 설정 (임시 파일 저장)
 const storage = multer.diskStorage({
@@ -88,7 +92,7 @@ const registerUpload = multer({
   }
 });
 
-const BACKEND_REGISTER_ENDPOINT = process.env.BACKEND_REGISTER_ENDPOINT || '';
+const BACKEND_REGISTER_ENDPOINT = 'https://kau-capstone.duckdns.org/model/register';
 
 // 암호화 키 생성 함수
 const generateEncryptionKey = () => {
@@ -190,13 +194,12 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     // 임시 파일 삭제
     await fs.unlink(filePath);
 
-    // 응답
+    // 응답 (프론트로 encryptionKey 절대 전달하지 않음)
     res.json({
       success: true,
       data: {
         ipfsHash: ipfsHash,
         metadataHash: metadataHash,
-        encryptionKey: encryptionKey,
         gateway: `http://${req.hostname}:8080/ipfs/${ipfsHash}`,
         metadata: metadata
       }
@@ -320,48 +323,42 @@ app.post('/ipfs/register', registerUpload.fields([
 
     const gateway = `http://${req.hostname}:8080/ipfs/${ipfsHash}`;
 
-    let backendResponse = null;
-    if (BACKEND_REGISTER_ENDPOINT) {
-      console.log('[register] 백엔드로 릴레이 요청 전송');
-      const relayBody = {
-        ...(metadataJson || {}),
-        ipfs: {
-          hash: ipfsHash,
-          metadataHash,
-          encryptionKey,
-          gateway
-        }
-      };
-
-      const backendRes = await fetch(BACKEND_REGISTER_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(relayBody)
-      });
-
-      const backendText = await backendRes.text();
-      try {
-        backendResponse = backendText ? JSON.parse(backendText) : null;
-      } catch (e) {
-        backendResponse = backendText;
+    // 고정된 백엔드로 릴레이 (항상 시도) — 백엔드에는 encryptionKey 포함
+    console.log('[register] 백엔드로 릴레이 요청 전송');
+    const relayBody = {
+      ...(metadataJson || {}),
+      ipfs: {
+        hash: ipfsHash,
+        metadataHash,
+        encryptionKey, // 백엔드에만 전달
+        gateway
       }
+    };
 
-      if (!backendRes.ok) {
-        throw new Error(`백엔드 전송 실패 (${backendRes.status}): ${backendText}`);
-      }
+    const backendRes = await fetch(BACKEND_REGISTER_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(relayBody)
+    });
+
+    const backendText = await backendRes.text();
+
+    if (!backendRes.ok) {
+      // 백엔드가 200-299가 아니면 실패 처리
+      throw new Error(`백엔드 전송 실패 (${backendRes.status}): ${backendText}`);
     }
 
     responded = true;
     await cleanupTempFiles();
 
+    // 성공 시 프론트로 encryptionKey를 절대 전달하지 않고 등록 완료만 알림
     return res.json({
       success: true,
       data: {
         ipfsHash,
         metadataHash,
-        encryptionKey,
         gateway,
-        backendResponse
+        registered: true
       }
     });
   } catch (error) {
