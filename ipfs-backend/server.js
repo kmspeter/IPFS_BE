@@ -94,7 +94,7 @@ const registerUpload = multer({
 
 const BACKEND_REGISTER_ENDPOINT = 'https://kau-capstone.duckdns.org/model/register';
 
-// 암호화 키 생성 함수
+// 암호화 키 생성 함수 (32바이트 난수 -> hex 문자열)
 const generateEncryptionKey = () => {
   return crypto.lib.WordArray.random(256 / 8).toString();
 };
@@ -325,21 +325,25 @@ app.post('/ipfs/register', registerUpload.fields([
 
     // 고정된 백엔드로 릴레이 (항상 시도) — 백엔드에는 encryptionKey 포함
     console.log('[register] 백엔드로 릴레이 요청 전송');
+
+    // ✅ 요구사항: 프론트 메타데이터에 'cidRoot'와 'encryptionKey' 두 개만 추가해서 전달
     const relayBody = {
       ...(metadataJson || {}),
-      ipfs: {
-        hash: ipfsHash,
-        metadataHash,
-        encryptionKey, // 백엔드에만 전달
-        gateway
-      }
+      cidRoot: ipfsHash,          // IPFS CID
+      encryptionKey               // 32바이트 난수 hex
+      // (참고) gateway, metadataHash 등은 전달하지 않음
     };
+
+    console.log('[register] 백엔드로 전달되는 데이터:', relayBody);
 
     const backendRes = await fetch(BACKEND_REGISTER_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(relayBody)
     });
+    
+
+    console.log(`[register] backend response status=${backendRes.status} ok=${backendRes.ok}`);
 
     const backendText = await backendRes.text();
 
