@@ -80,6 +80,16 @@ const upload = multer({
   }
 });
 
+// 모델 등록 전용 업로드 (대용량 지원)
+const registerUpload = multer({
+  storage: storage,
+  limits: {
+    fileSize: Number(process.env.REGISTER_FILE_LIMIT || 1024 * 1024 * 1024 * 4) // 기본 4GB
+  }
+});
+
+const BACKEND_REGISTER_ENDPOINT = process.env.BACKEND_REGISTER_ENDPOINT || '';
+
 // 암호화 키 생성 함수
 const generateEncryptionKey = () => {
   return crypto.lib.WordArray.random(256 / 8).toString();
@@ -204,6 +214,163 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       success: false,
       error: error.message
     });
+  }
+});
+
+// 모델 파일 + 메타데이터 등록 (IPFS 업로드 후 백엔드 릴레이)
+app.post('/ipfs/register', registerUpload.fields([
+  { name: 'model', maxCount: 1 },
+  { name: 'metadata', maxCount: 1 }
+]), async (req, res) => {
+  const controller = new AbortController();
+  let modelFilePath = null;
+  let metadataFilePath = null;
+  let responded = false;
+
+  const cleanupTempFiles = async () => {
+    const tasks = [];
+    if (modelFilePath) tasks.push(fs.unlink(modelFilePath).catch(() => {}));
+    if (metadataFilePath) tasks.push(fs.unlink(metadataFilePath).catch(() => {}));
+    await Promise.all(tasks);
+  };
+
+  const abortHandler = async () => {
+    if (responded) return;
+    responded = true;
+    controller.abort();
+    await cleanupTempFiles();
+  };
+
+  req.on('aborted', () => {
+    console.warn('요청 연결이 중단되어 업로드를 취소합니다.');
+    abortHandler().catch(console.error);
+  });
+
+  try {
+    const modelFiles = req.files?.model || [];
+    if (!modelFiles.length) {
+      responded = true;
+      await cleanupTempFiles();
+      return res.status(400).json({ success: false, error: '모델 파일이 필요합니다.' });
+    }
+
+    const modelFile = modelFiles[0];
+    modelFilePath = modelFile.path;
+
+    const metadataFiles = req.files?.metadata || [];
+    if (metadataFiles.length) {
+      metadataFilePath = metadataFiles[0].path;
+    }
+
+    let metadataJson = null;
+    try {
+      if (metadataFilePath) {
+        const raw = await fs.readFile(metadataFilePath, 'utf8');
+        metadataJson = JSON.parse(raw);
+      } else if (typeof req.body?.metadata === 'string') {
+        metadataJson = JSON.parse(req.body.metadata);
+      }
+    } catch (parseErr) {
+      responded = true;
+      await cleanupTempFiles();
+      return res.status(400).json({ success: false, error: '메타데이터 파싱 실패: ' + parseErr.message });
+    }
+
+    if (!metadataJson) {
+      responded = true;
+      await cleanupTempFiles();
+      return res.status(400).json({ success: false, error: '메타데이터가 필요합니다.' });
+    }
+
+    const encryptionKey = generateEncryptionKey();
+    console.log('[register] 파일 암호화 시작');
+    const encryptedBuffer = await encryptFile(modelFilePath, encryptionKey);
+
+    console.log('[register] IPFS 업로드 시작');
+    const ipfs = await getIpfs();
+    let addResult;
+    try {
+      addResult = await ipfs.add(encryptedBuffer, {
+        signal: controller.signal,
+        progress: (prog) => console.log(`[register] 업로드 진행률: ${prog}`)
+      });
+    } catch (err) {
+      if (controller.signal.aborted) {
+        responded = true;
+        await cleanupTempFiles();
+        return; // 요청이 이미 중단됨
+      }
+      throw err;
+    }
+
+    const ipfsHash = (addResult.cid ?? addResult.path).toString();
+
+    const registrationMetadata = {
+      originalName: modelFile.originalname,
+      size: modelFile.size,
+      mimeType: modelFile.mimetype,
+      uploadDate: new Date().toISOString(),
+      ipfsHash,
+      encrypted: true,
+      payload: metadataJson || null
+    };
+
+    const metadataResult = await ipfs.add(JSON.stringify(registrationMetadata), { signal: controller.signal });
+    const metadataHash = (metadataResult.cid ?? metadataResult.path).toString();
+
+    const gateway = `http://${req.hostname}:8080/ipfs/${ipfsHash}`;
+
+    let backendResponse = null;
+    if (BACKEND_REGISTER_ENDPOINT) {
+      console.log('[register] 백엔드로 릴레이 요청 전송');
+      const relayBody = {
+        ...(metadataJson || {}),
+        ipfs: {
+          hash: ipfsHash,
+          metadataHash,
+          encryptionKey,
+          gateway
+        }
+      };
+
+      const backendRes = await fetch(BACKEND_REGISTER_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(relayBody)
+      });
+
+      const backendText = await backendRes.text();
+      try {
+        backendResponse = backendText ? JSON.parse(backendText) : null;
+      } catch (e) {
+        backendResponse = backendText;
+      }
+
+      if (!backendRes.ok) {
+        throw new Error(`백엔드 전송 실패 (${backendRes.status}): ${backendText}`);
+      }
+    }
+
+    responded = true;
+    await cleanupTempFiles();
+
+    return res.json({
+      success: true,
+      data: {
+        ipfsHash,
+        metadataHash,
+        encryptionKey,
+        gateway,
+        backendResponse
+      }
+    });
+  } catch (error) {
+    console.error('모델 등록 실패:', error);
+    if (!responded) {
+      responded = true;
+      await cleanupTempFiles();
+      return res.status(500).json({ success: false, error: error.message });
+    }
   }
 });
 
