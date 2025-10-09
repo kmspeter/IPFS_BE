@@ -7,16 +7,53 @@ const path = require('path');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const compression = require('compression');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// ---- S3 클라이언트 설정 ----
+const s3Client = new S3Client({
+  region: process.env.AWS_REGION || 'ap-northeast-2',
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
+
+const S3_BUCKET = process.env.S3_BUCKET_NAME || 'ai-model-hub';
+const S3_BASE_URL = process.env.S3_BASE_URL || `https://${S3_BUCKET}.s3.${process.env.AWS_REGION || 'ap-northeast-2'}.amazonaws.com`;
+
+// S3 업로드 헬퍼 함수
+const uploadToS3 = async (filePath, fileName, mimeType) => {
+  try {
+    const fileContent = await fs.readFile(filePath);
+    const key = `model-assets/${Date.now()}-${fileName}`;
+
+    const command = new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
+      Body: fileContent,
+      ContentType: mimeType,
+      // ACL: 'public-read' // 퍼블릭 읽기 권한 (필요시)
+    });
+
+    await s3Client.send(command);
+
+    // S3 URL 반환
+    return `${S3_BASE_URL}/${key}`;
+  } catch (error) {
+    console.error('S3 업로드 실패:', error);
+    throw new Error('S3 업로드 실패: ' + error.message);
+  }
+};
+
 // ---- IPFS 클라이언트 (동적 import + lazy init) ----
 let _ipfsClient = null;
 const getIpfs = async () => {
   if (_ipfsClient) return _ipfsClient;
-  const { create } = await import('ipfs-http-client'); // ESM 동적 import
+  const { create } = await import('ipfs-http-client');
   const apiUrl = process.env.IPFS_API_URL || 'http://127.0.0.1:5001/api/v0';
   _ipfsClient = create({ url: apiUrl });
   return _ipfsClient;
@@ -29,7 +66,6 @@ if (typeof fetch === 'undefined') {
 
 // 미들웨어 설정
 app.use(helmet({
-  // 교차 출처 다운로드(파일 응답) 시 정책 완화가 필요한 경우에만 유지
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 app.use(compression());
@@ -43,7 +79,6 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS
 
 app.use(cors({
   origin(origin, cb) {
-    // 서버-서버/모바일앱 등 Origin 없는 요청은 허용
     if (!origin) return cb(null, true);
     return allowedOrigins.includes(origin)
       ? cb(null, true)
@@ -54,14 +89,11 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// 프리플라이트(OPTIONS) 응답
 app.options(/.*/, cors());
-
 app.use(express.json({ limit: '10mb' }));
 
 // Multer 설정 (임시 파일 저장)
 const storage = multer.diskStorage({
-  // multer의 destination 콜백은 async를 공식지원하진 않지만, 내부에서 await 후 cb 호출하도록 유지
   destination: async (req, file, cb) => {
     try {
       const uploadDir = 'uploads/';
@@ -92,9 +124,9 @@ const registerUpload = multer({
   }
 });
 
-const BACKEND_REGISTER_ENDPOINT = 'https://kau-capstone.duckdns.org/model/register';
+const BACKEND_REGISTER_ENDPOINT = process.env.BACKEND_REGISTER_ENDPOINT || 'https://kau-capstone.duckdns.org/model/register';
 
-// 암호화 키 생성 함수 (32바이트 난수 -> hex 문자열)
+// 암호화 키 생성 함수
 const generateEncryptionKey = () => {
   return crypto.lib.WordArray.random(256 / 8).toString();
 };
@@ -104,10 +136,7 @@ const encryptFile = async (filePath, encryptionKey) => {
   try {
     const fileBuffer = await fs.readFile(filePath);
     const fileContent = fileBuffer.toString('base64');
-
-    // AES 암호화
     const encrypted = crypto.AES.encrypt(fileContent, encryptionKey).toString();
-
     return Buffer.from(encrypted);
   } catch (error) {
     throw new Error('파일 암호화 실패: ' + error.message);
@@ -119,7 +148,6 @@ const decryptFile = (encryptedData, encryptionKey) => {
   try {
     const decrypted = crypto.AES.decrypt(encryptedData.toString(), encryptionKey);
     const decryptedBase64 = decrypted.toString(crypto.enc.Utf8);
-
     return Buffer.from(decryptedBase64, 'base64');
   } catch (error) {
     throw new Error('파일 복호화 실패: ' + error.message);
@@ -149,6 +177,33 @@ app.get('/ipfs/status', async (req, res) => {
   }
 });
 
+// S3 연결 상태 확인
+app.get('/s3/status', async (req, res) => {
+  try {
+    // 간단한 테스트 업로드
+    const testKey = `health-check/${Date.now()}.txt`;
+    const command = new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: testKey,
+      Body: 'health check',
+      ContentType: 'text/plain'
+    });
+    
+    await s3Client.send(command);
+    
+    res.json({
+      status: 'connected',
+      bucket: S3_BUCKET,
+      region: process.env.AWS_REGION || 'ap-northeast-2'
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'disconnected',
+      error: error.message
+    });
+  }
+});
+
 // 파일 업로드 및 암호화 후 IPFS 저장
 app.post('/upload', upload.single('file'), async (req, res) => {
   let filePath = null;
@@ -159,25 +214,19 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 
     filePath = req.file.path;
-
-    // 암호화 키 생성
     const encryptionKey = generateEncryptionKey();
 
-    // 파일 암호화
     console.log('파일 암호화 중...');
     const encryptedBuffer = await encryptFile(filePath, encryptionKey);
 
-    // IPFS에 암호화된 파일 업로드
     console.log('IPFS에 업로드 중...');
     const ipfs = await getIpfs();
     const addResult = await ipfs.add(encryptedBuffer, {
       progress: (prog) => console.log(`업로드 진행률: ${prog}`)
     });
 
-    // 최신 ipfs-http-client는 cid 중심 반환
     const ipfsHash = (addResult.cid ?? addResult.path).toString();
 
-    // 메타데이터 생성
     const metadata = {
       originalName: req.file.originalname,
       size: req.file.size,
@@ -187,14 +236,11 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       encrypted: true
     };
 
-    // 메타데이터도 IPFS에 저장
     const metadataResult = await ipfs.add(JSON.stringify(metadata));
     const metadataHash = (metadataResult.cid ?? metadataResult.path).toString();
 
-    // 임시 파일 삭제
     await fs.unlink(filePath);
 
-    // 응답 (프론트로 encryptionKey 절대 전달하지 않음)
     res.json({
       success: true,
       data: {
@@ -207,12 +253,9 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
   } catch (error) {
     console.error('업로드 에러:', error);
-
-    // 에러 발생 시 임시 파일 삭제
     if (filePath) {
       await fs.unlink(filePath).catch(console.error);
     }
-
     res.status(500).json({
       success: false,
       error: error.message
@@ -220,20 +263,23 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// 모델 파일 + 메타데이터 등록 (IPFS 업로드 후 백엔드 릴레이)
+// 모델 파일 + 메타데이터 등록 (IPFS 업로드 + S3 업로드 + 백엔드 릴레이)
 app.post('/ipfs/register', registerUpload.fields([
   { name: 'model', maxCount: 1 },
-  { name: 'metadata', maxCount: 1 }
+  { name: 'metadata', maxCount: 1 },
+  { name: 'thumbnail', maxCount: 1 },
+  { name: 'sample-prompt', maxCount: 1 },
+  { name: 'sample-output', maxCount: 1 },
+  { name: 'sample-outputImage', maxCount: 1 },
+  { name: 'sample-inputImage', maxCount: 1 },
+  { name: 'sample-inputAudio', maxCount: 1 }
 ]), async (req, res) => {
   const controller = new AbortController();
-  let modelFilePath = null;
-  let metadataFilePath = null;
   let responded = false;
+  const tempFiles = [];
 
   const cleanupTempFiles = async () => {
-    const tasks = [];
-    if (modelFilePath) tasks.push(fs.unlink(modelFilePath).catch(() => {}));
-    if (metadataFilePath) tasks.push(fs.unlink(metadataFilePath).catch(() => {}));
+    const tasks = tempFiles.map(fp => fs.unlink(fp).catch(() => {}));
     await Promise.all(tasks);
   };
 
@@ -250,6 +296,7 @@ app.post('/ipfs/register', registerUpload.fields([
   });
 
   try {
+    // 1. 모델 파일 확인
     const modelFiles = req.files?.model || [];
     if (!modelFiles.length) {
       responded = true;
@@ -258,17 +305,18 @@ app.post('/ipfs/register', registerUpload.fields([
     }
 
     const modelFile = modelFiles[0];
-    modelFilePath = modelFile.path;
+    tempFiles.push(modelFile.path);
 
+    // 2. 메타데이터 파싱
     const metadataFiles = req.files?.metadata || [];
     if (metadataFiles.length) {
-      metadataFilePath = metadataFiles[0].path;
+      tempFiles.push(metadataFiles[0].path);
     }
 
     let metadataJson = null;
     try {
-      if (metadataFilePath) {
-        const raw = await fs.readFile(metadataFilePath, 'utf8');
+      if (metadataFiles.length) {
+        const raw = await fs.readFile(metadataFiles[0].path, 'utf8');
         metadataJson = JSON.parse(raw);
       } else if (typeof req.body?.metadata === 'string') {
         metadataJson = JSON.parse(req.body.metadata);
@@ -285,29 +333,77 @@ app.post('/ipfs/register', registerUpload.fields([
       return res.status(400).json({ success: false, error: '메타데이터가 필요합니다.' });
     }
 
-    const encryptionKey = generateEncryptionKey();
-    console.log('[register] 파일 암호화 시작');
-    const encryptedBuffer = await encryptFile(modelFilePath, encryptionKey);
+    // 3. 썸네일 파일 S3 업로드
+    let thumbnailUrl = null;
+    const thumbnailFiles = req.files?.thumbnail || [];
+    if (thumbnailFiles.length) {
+      const thumbnailFile = thumbnailFiles[0];
+      tempFiles.push(thumbnailFile.path);
+      
+      console.log('[register] 썸네일 S3 업로드 시작');
+      thumbnailUrl = await uploadToS3(
+        thumbnailFile.path,
+        thumbnailFile.originalname,
+        thumbnailFile.mimetype
+      );
+      console.log('[register] 썸네일 S3 URL:', thumbnailUrl);
+    }
 
+    // 4. 샘플 파일들 S3 업로드
+    const sampleFileFields = [
+      'sample-outputImage',
+      'sample-inputImage', 
+      'sample-inputAudio'
+    ];
+
+    const sampleUrls = {};
+    for (const fieldName of sampleFileFields) {
+      const files = req.files?.[fieldName] || [];
+      if (files.length) {
+        const file = files[0];
+        tempFiles.push(file.path);
+        
+        console.log(`[register] ${fieldName} S3 업로드 시작`);
+        const s3Url = await uploadToS3(
+          file.path,
+          file.originalname,
+          file.mimetype
+        );
+        
+        // fieldName에서 'sample-' 제거하여 키 생성
+        const key = fieldName.replace('sample-', '');
+        sampleUrls[key] = s3Url;
+        console.log(`[register] ${fieldName} S3 URL:`, s3Url);
+      }
+    }
+
+    // 5. 모델 파일 암호화
+    const encryptionKey = generateEncryptionKey();
+    console.log('[register] 모델 파일 암호화 시작');
+    const encryptedBuffer = await encryptFile(modelFile.path, encryptionKey);
+
+    // 6. IPFS 업로드
     console.log('[register] IPFS 업로드 시작');
     const ipfs = await getIpfs();
     let addResult;
     try {
       addResult = await ipfs.add(encryptedBuffer, {
         signal: controller.signal,
-        progress: (prog) => console.log(`[register] 업로드 진행률: ${prog}`)
+        progress: (prog) => console.log(`[register] IPFS 업로드 진행률: ${prog}`)
       });
     } catch (err) {
       if (controller.signal.aborted) {
         responded = true;
         await cleanupTempFiles();
-        return; // 요청이 이미 중단됨
+        return;
       }
       throw err;
     }
 
     const ipfsHash = (addResult.cid ?? addResult.path).toString();
+    console.log('[register] IPFS 업로드 완료:', ipfsHash);
 
+    // 7. IPFS 메타데이터 저장
     const registrationMetadata = {
       originalName: modelFile.originalname,
       size: modelFile.size,
@@ -318,59 +414,84 @@ app.post('/ipfs/register', registerUpload.fields([
       payload: metadataJson || null
     };
 
-    const metadataResult = await ipfs.add(JSON.stringify(registrationMetadata), { signal: controller.signal });
+    const metadataResult = await ipfs.add(JSON.stringify(registrationMetadata), { 
+      signal: controller.signal 
+    });
     const metadataHash = (metadataResult.cid ?? metadataResult.path).toString();
 
     const gateway = `http://${req.hostname}:8080/ipfs/${ipfsHash}`;
 
-    // 고정된 백엔드로 릴레이 (항상 시도) — 백엔드에는 encryptionKey 포함
-    console.log('[register] 백엔드로 릴레이 요청 전송');
+    // 8. 백엔드로 릴레이할 데이터 구성
+    console.log('[register] 백엔드로 릴레이 요청 준비');
 
-    // ✅ 요구사항: 프론트 메타데이터에 'cidRoot'와 'encryptionKey' 두 개만 추가해서 전달
+    // 메타데이터의 sample 객체 수정: S3 URL로 교체
+    const modifiedMetadata = { ...metadataJson };
+    
+    if (modifiedMetadata.sample) {
+      // 썸네일 URL 추가
+      if (thumbnailUrl) {
+        modifiedMetadata.thumbnail = thumbnailUrl;
+      }
+
+      // 샘플 파일 URL로 교체
+      Object.keys(sampleUrls).forEach(key => {
+        if (modifiedMetadata.sample[key]) {
+          modifiedMetadata.sample[key] = sampleUrls[key];
+        }
+      });
+    }
+
     const relayBody = {
-      ...(metadataJson || {}),
-      cidRoot: ipfsHash,          // IPFS CID
-      encryptionKey               // 32바이트 난수 hex
-      // (참고) gateway, metadataHash 등은 전달하지 않음
+      ...modifiedMetadata,
+      cidRoot: ipfsHash,
+      encryptionKey
     };
 
-    console.log('[register] 백엔드로 전달되는 데이터:', relayBody);
+    console.log('[register] 백엔드로 전달되는 데이터:', JSON.stringify(relayBody, null, 2));
 
+    // 9. 백엔드로 전송
     const backendRes = await fetch(BACKEND_REGISTER_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(relayBody)
+      body: JSON.stringify(relayBody),
+      signal: controller.signal
     });
-    
 
-    console.log(`[register] backend response status=${backendRes.status} ok=${backendRes.ok}`);
+    console.log(`[register] 백엔드 응답 status=${backendRes.status} ok=${backendRes.ok}`);
 
     const backendText = await backendRes.text();
 
     if (!backendRes.ok) {
-      // 백엔드가 200-299가 아니면 실패 처리
       throw new Error(`백엔드 전송 실패 (${backendRes.status}): ${backendText}`);
     }
 
+    // 10. 임시 파일 정리
     responded = true;
     await cleanupTempFiles();
 
-    // 성공 시 프론트로 encryptionKey를 절대 전달하지 않고 등록 완료만 알림
+    // 11. 성공 응답
     return res.json({
       success: true,
+      message: '모델이 성공적으로 등록되었습니다.',
       data: {
         ipfsHash,
         metadataHash,
         gateway,
+        thumbnailUrl,
+        sampleUrls,
         registered: true
       }
     });
+
   } catch (error) {
-    console.error('모델 등록 실패:', error);
+    console.error('[register] 모델 등록 실패:', error);
     if (!responded) {
       responded = true;
       await cleanupTempFiles();
-      return res.status(500).json({ success: false, error: error.message });
+      return res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
     }
   }
 });
@@ -388,7 +509,6 @@ app.post('/retrieve', async (req, res) => {
 
     const ipfs = await getIpfs();
 
-    // IPFS에서 암호화된 파일 가져오기
     console.log('IPFS에서 파일 가져오는 중...');
     const chunks = [];
     for await (const chunk of ipfs.cat(ipfsHash)) {
@@ -396,11 +516,9 @@ app.post('/retrieve', async (req, res) => {
     }
     const encryptedData = Buffer.concat(chunks);
 
-    // 파일 복호화
     console.log('파일 복호화 중...');
     const decryptedBuffer = decryptFile(encryptedData, encryptionKey);
 
-    // 메타데이터 가져오기 (옵션)
     let metadata = null;
     if (metadataHash) {
       const metaChunks = [];
@@ -410,7 +528,6 @@ app.post('/retrieve', async (req, res) => {
       metadata = JSON.parse(Buffer.concat(metaChunks).toString());
     }
 
-    // 파일 전송
     res.set({
       'Content-Type': metadata?.mimeType || 'application/octet-stream',
       'Content-Disposition': `attachment; filename="${metadata?.originalName || 'file'}"`
@@ -449,4 +566,6 @@ app.get('/files/:metadataHash', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`서버가 포트 ${PORT}에서 실행 중입니다.`);
   console.log(`IPFS Gateway: http://localhost:8080`);
+  console.log(`S3 Bucket: ${S3_BUCKET}`);
+  console.log(`Backend Endpoint: ${BACKEND_REGISTER_ENDPOINT}`);
 });
