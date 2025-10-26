@@ -124,7 +124,7 @@ const registerUpload = multer({
   }
 });
 
-const BACKEND_REGISTER_ENDPOINT = process.env.BACKEND_REGISTER_ENDPOINT || 'https://kau-capstone.duckdns.org/model/register';
+const BACKEND_REGISTER_ENDPOINT = process.env.BACKEND_REGISTER_ENDPOINT || 'https://kau-capstone.duckdns.org/api/models/upload';
 
 // 암호화 키 생성 함수
 const generateEncryptionKey = () => {
